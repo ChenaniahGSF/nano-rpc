@@ -64,6 +64,11 @@ bool decode_string_callback(pb_istream_t *stream, const pb_field_t *field, void 
 void register_rpc_method(const char *name, rpc_func_t func) {
     pthread_rwlock_wrlock(&rpc_lock);
     rpc_entry_t *entry = (rpc_entry_t*)malloc(sizeof(rpc_entry_t));
+    if(entry == NULL) {
+        perror("malloc error");
+        pthread_rwlock_unlock(&rpc_lock);
+        return;
+    }
     strcpy(entry->name, name);
     entry->func = func;
     HASH_ADD_STR(rpc_methods, name, entry);
@@ -73,6 +78,9 @@ void register_rpc_method(const char *name, rpc_func_t func) {
 // 解析 RPC 请求
 bool decode_request(uint8_t *buffer, size_t len, RPCRequest *request) {
     pb_istream_t stream = pb_istream_from_buffer(buffer, len);
+    if (len > BUFFER_SIZE) {
+        return false; // 防止缓冲区溢出
+    }
     return pb_decode(&stream, RPCRequest_fields, request);
 }
 
@@ -113,11 +121,13 @@ void handle_rpc_request(int client_fd) {
 
     if(!request.method.arg) {
         printf("request.method.arg = null\n");
+        close(client_fd);
         return;
     }
 
     if(!rpc_methods) {
         printf("pc_methods = null\n");
+        close(client_fd);
         return;
     }
 
@@ -136,7 +146,9 @@ void handle_rpc_request(int client_fd) {
     }
 
     size_t resp_len = encode_response(&response, buffer, BUFFER_SIZE);
-    send(client_fd, buffer, resp_len, 0);
+    if(send(client_fd, buffer, resp_len, 0) == -1) {
+        perror("send error");
+    }
     close(client_fd);
 }
 
@@ -159,46 +171,100 @@ int main() {
     register_rpc_method("divide", rpc_divide);
 
     thpool = thpool_init(THREAD_POOL_SIZE);
+    if(thpool == NULL) {
+        perror("thpool_init error");
+        exit(EXIT_FAILURE);
+    }
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    fcntl(server_fd, F_SETFL, O_NONBLOCK);
+    if(server_fd < 0) {
+        perror("Socket creation failed");
+        thpool_destroy(thpool);
+        exit(EXIT_FAILURE);
+    }
+    if(fcntl(server_fd, F_SETFL, O_NONBLOCK) < 0) {
+        perror("fcntl failed");
+        close(server_fd);
+        thpool_destroy(thpool);
+        exit(EXIT_FAILURE);
+    }
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(PORT);
     if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("Bind failed");
+        close(server_fd);
+        thpool_destroy(thpool);
         exit(EXIT_FAILURE);
     }
     if (listen(server_fd, SOMAXCONN) < 0) {
         perror("Listen failed");
+        close(server_fd);
+        thpool_destroy(thpool);
         exit(EXIT_FAILURE);
     }
 
     epoll_fd = epoll_create1(0);
+    if(epoll_fd < 0) {
+        perror("Epoll creation failed");
+        close(server_fd);
+        thpool_destroy(thpool);
+        exit(EXIT_FAILURE);
+    }
     ev.events = EPOLLIN;
     ev.data.fd = server_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
-
+    if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) < 0) {
+        perror("Epoll control failed");
+        close(server_fd);
+        close(epoll_fd);
+        thpool_destroy(thpool);
+        exit(EXIT_FAILURE);
+    }
     printf("RPC Server started on port %d\n", PORT);
     while (1) {
         event_count = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        if (event_count < 0) {
+            perror("Epoll wait failed");
+            if(errno != EINTR) {
+                close(server_fd);
+                close(epoll_fd);
+                thpool_destroy(thpool);
+                exit(EXIT_FAILURE);
+            }
+            continue;
+        }
         for (int i = 0; i < event_count; i++) {
             if (events[i].data.fd == server_fd) {
                 while ((client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len)) > 0) {
-                    fcntl(client_fd, F_SETFL, O_NONBLOCK);
+                    if(fcntl(client_fd, F_SETFL, O_NONBLOCK) < 0) {
+                        perror("Set client socket to non-blocking mode failed");
+                        close(client_fd);
+                        continue;
+                    }
                     ev.events = EPOLLIN | EPOLLET;
                     ev.data.fd = client_fd;
-                    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
+                    if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
+                        perror("Epoll control failed");
+                        close(client_fd);
+                    }
                 }
             } else {
                 int *client_fd_ptr = malloc(sizeof(int));
+                if(client_fd_ptr == NULL) {
+                    perror("malloc error");
+                    close(events[i].data.fd);
+                    continue;
+                }
                 *client_fd_ptr = events[i].data.fd;
                 //printf("thpool_add_work\n");
-                thpool_add_work(thpool, process_client, client_fd_ptr);
+                if(thpool_add_work(thpool, process_client, client_fd_ptr) == -1) {
+                    perror("thpool_add_work error");
+                    free(client_fd_ptr);
+                    close(events[i].data.fd);
+                }
             }
         }
     }
-
     close(server_fd);
     close(epoll_fd);
     thpool_destroy(thpool);
