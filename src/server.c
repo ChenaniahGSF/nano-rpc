@@ -95,61 +95,68 @@ size_t encode_response(RPCResponse *response, uint8_t *buffer, size_t buf_size) 
 
 // 处理 RPC 请求
 void handle_rpc_request(int client_fd) {
+    printf("handle_rpc_request called ++++\n");
     uint8_t buffer[BUFFER_SIZE];
-    int msg_len = recv(client_fd, buffer, BUFFER_SIZE, 0);
-    if (msg_len <= 0) {
-        close(client_fd);
-        return;
-    }
+    while (1) {
+        printf("while called ---- \n");
+        int msg_len = recv(client_fd, buffer, BUFFER_SIZE, 0);
+        if (msg_len <= 0) {
+            if (msg_len == 0) {
+                printf("Client disconnected: %d\n", client_fd);
+            } else {
+                printf("Error receiving data from client: %d\n", client_fd);
+            }
+            close(client_fd);
+            break;
+        }
 
-    printf("thread %u received:", (unsigned int)pthread_self());
-    print_hex(buffer, msg_len);
+        printf("thread %u received:", (unsigned int)pthread_self());
+        print_hex(buffer, msg_len);
 
-    RPCRequest request = RPCRequest_init_zero;
-    char buf[BUFFER_SIZE] = {0};
-    request.method.funcs.decode = &decode_string_callback;
-    request.method.arg = buf;
-    if (!decode_request(buffer, msg_len, &request)) {
+        RPCRequest request = RPCRequest_init_zero;
+        char buf[BUFFER_SIZE] = {0};
+        request.method.funcs.decode = &decode_string_callback;
+        request.method.arg = buf;
+        if (!decode_request(buffer, msg_len, &request)) {
+            RPCResponse response = RPCResponse_init_zero;
+            size_t resp_len = encode_response(&response, buffer, BUFFER_SIZE);
+            send(client_fd, buffer, resp_len, 0);
+            continue;
+        }
+
         RPCResponse response = RPCResponse_init_zero;
+
+        if (!request.method.arg) {
+            printf("request.method.arg = null\n");
+            continue;
+        }
+
+        if (!rpc_methods) {
+            printf("pc_methods = null\n");
+            continue;
+        }
+
+        pthread_rwlock_rdlock(&rpc_lock);
+        rpc_entry_t *entry;
+        HASH_FIND_STR(rpc_methods, request.method.arg, entry);
+        pthread_rwlock_unlock(&rpc_lock);
+
+        if (entry && request.has_num1 && request.has_num2) {
+            response.which_result = RPCResponse_value_tag;
+            response.result.value = entry->func(request.num1, request.num2);
+        } else {
+            response.which_result = RPCResponse_error_tag;
+            response.result.error.funcs.encode = NULL;
+            response.result.error.arg = NULL;
+        }
+
         size_t resp_len = encode_response(&response, buffer, BUFFER_SIZE);
-        send(client_fd, buffer, resp_len, 0);
-        close(client_fd);
-        return;
+        if (send(client_fd, buffer, resp_len, 0) == -1) {
+            perror("Send failed");
+            close(client_fd);
+            break;
+        }
     }
-
-    RPCResponse response = RPCResponse_init_zero;
-
-    if(!request.method.arg) {
-        printf("request.method.arg = null\n");
-        close(client_fd);
-        return;
-    }
-
-    if(!rpc_methods) {
-        printf("pc_methods = null\n");
-        close(client_fd);
-        return;
-    }
-
-    pthread_rwlock_rdlock(&rpc_lock);
-    rpc_entry_t *entry;
-    HASH_FIND_STR(rpc_methods, request.method.arg, entry);
-    pthread_rwlock_unlock(&rpc_lock);
-
-    if (entry && request.has_num1 && request.has_num2) {
-        response.which_result = RPCResponse_value_tag;
-        response.result.value = entry->func(request.num1, request.num2);
-    } else {
-        response.which_result = RPCResponse_error_tag;
-        response.result.error.funcs.encode = NULL;
-        response.result.error.arg = NULL;
-    }
-
-    size_t resp_len = encode_response(&response, buffer, BUFFER_SIZE);
-    if(send(client_fd, buffer, resp_len, 0) == -1) {
-        perror("send error");
-    }
-    close(client_fd);
 }
 
 // 线程池任务
