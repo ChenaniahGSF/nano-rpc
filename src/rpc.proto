@@ -1,0 +1,16 @@
+syntax = "proto2";
+
+message RPCRequest {
+    required string method = 1;
+    optional string func_name = 2;
+    optional int32 num1 = 3;
+    optional int32 num2 = 4;
+}
+
+message RPCResponse {
+    oneof result {
+        int32 value = 1;
+        string error = 2;
+    }
+}
+
