@@ -209,16 +209,52 @@ void send_rpc_request(ConnectionPool *pool, const char *method, int num1, int nu
     release_connection(pool, sockfd);
 }
 
+typedef struct {
+    ConnectionPool *pool;
+    const char *method;
+    int num1;
+    int num2;
+} RequestParams;
+
+
+void* thread_send_rpc_request(void* arg) {
+    RequestParams *params = (RequestParams*)arg;
+    send_rpc_request(params->pool, params->method, params->num1, params->num2);
+    free(params);
+    return NULL;
+}
+
 // 主函数
 int main() {
     ConnectionPool pool;
     init_connection_pool(&pool);
 
-    send_rpc_request(&pool, "add", 10, 5);
-    send_rpc_request(&pool, "subtract", 10, 5);
-    send_rpc_request(&pool, "multiply", 10, 5);
-    send_rpc_request(&pool, "divide", 10, 5);
-    send_rpc_request(&pool, "divide", 10, 0);
+    pthread_t threads[5];
+    const char *methods[] = {"add", "subtract", "multiply", "divide", "divide"};
+    int nums1[] = {10, 10, 10, 10, 10};
+    int nums2[] = {5, 5, 5, 5, 0};
+
+    for (int i = 0; i < 5; i++) {
+        RequestParams *params = (RequestParams*)malloc(sizeof(RequestParams));
+        if (params == NULL) {
+            perror("malloc error");
+            continue;
+        }
+        params->pool = &pool;
+        params->method = methods[i];
+        params->num1 = nums1[i];
+        params->num2 = nums2[i];
+
+        if (pthread_create(&threads[i], NULL, thread_send_rpc_request, (void*)params) != 0) {
+            perror("pthread_create error");
+            free(params);
+        }
+    }
+
+    // 等待所有线程完成
+    for (int i = 0; i < 5; i++) {
+        pthread_join(threads[i], NULL);
+    }
 
     // 关闭连接池中的所有连接
     for (int i = 0; i < CONNECTION_POOL_SIZE; i++) {
