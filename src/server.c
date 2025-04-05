@@ -106,7 +106,6 @@ void handle_rpc_request(int client_fd) {
             } else {
                 printf("Error receiving data from client: %d\n", client_fd);
             }
-            close(client_fd);
             break;
         }
 
