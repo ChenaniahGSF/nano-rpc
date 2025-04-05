@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 #include "rpc.pb.h"
 #include "pb_encode.h"
 #include "pb_decode.h"
@@ -10,6 +11,14 @@
 #define SERVER_IP "127.0.0.1"
 #define SERVER_PORT 12345
 #define BUFFER_SIZE 256
+#define CONNECTION_POOL_SIZE 5
+
+// 连接池结构体
+typedef struct {
+    int connections[CONNECTION_POOL_SIZE];
+    int available[CONNECTION_POOL_SIZE];
+    pthread_mutex_t lock;
+} ConnectionPool;
 
 static void print_hex(unsigned char *in, int in_len)
 {
@@ -45,17 +54,95 @@ bool decode_response(uint8_t *buffer, size_t len, RPCResponse *response) {
     return pb_decode(&stream, RPCResponse_fields, response);
 }
 
-// 发送 RPC 请求
-void send_rpc_request(const char *method, int num1, int num2) {
+// 初始化连接池
+void init_connection_pool(ConnectionPool *pool) {
+    pthread_mutex_init(&pool->lock, NULL);
+    for (int i = 0; i < CONNECTION_POOL_SIZE; i++) {
+        pool->connections[i] = socket(AF_INET, SOCK_STREAM, 0);
+        if (pool->connections[i] == -1) {
+            perror("Socket creation failed");
+            exit(EXIT_FAILURE);
+        }
+        struct sockaddr_in server_addr;
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(SERVER_PORT);
+        inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
+        if (connect(pool->connections[i], (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
+            perror("Connect failed");
+            close(pool->connections[i]);
+            exit(EXIT_FAILURE);
+        }
+        pool->available[i] = 1;
+    }
+}
+
+// 获取一个可用的连接
+int get_connection(ConnectionPool *pool) {
+    pthread_mutex_lock(&pool->lock);
+    for (int i = 0; i < CONNECTION_POOL_SIZE; i++) {
+        if (pool->available[i]) {
+            pool->available[i] = 0;
+            pthread_mutex_unlock(&pool->lock);
+            return pool->connections[i];
+        }
+    }
+    pthread_mutex_unlock(&pool->lock);
+    return -1;
+}
+
+// 释放连接
+void release_connection(ConnectionPool *pool, int conn) {
+    pthread_mutex_lock(&pool->lock);
+    for (int i = 0; i < CONNECTION_POOL_SIZE; i++) {
+        if (pool->connections[i] == conn) {
+            pool->available[i] = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&pool->lock);
+}
+
+// 重新建立连接
+int reestablish_connection() {
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd == -1) {
+        perror("Socket creation failed");
+        return -1;
+    }
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(SERVER_PORT);
     inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
-
-    if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+    if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
         perror("Connect failed");
         close(sockfd);
+        return -1;
+    }
+    return sockfd;
+}
+
+// 处理连接关闭
+void handle_connection_closed(ConnectionPool *pool, int conn) {
+    pthread_mutex_lock(&pool->lock);
+    for (int i = 0; i < CONNECTION_POOL_SIZE; i++) {
+        if (pool->connections[i] == conn) {
+            close(pool->connections[i]);
+            int new_conn = reestablish_connection();
+            if (new_conn != -1) {
+                pool->connections[i] = new_conn;
+            }
+            pool->available[i] = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&pool->lock);
+}
+
+// 发送 RPC 请求
+void send_rpc_request(ConnectionPool *pool, const char *method, int num1, int num2) {
+    int sockfd = get_connection(pool);
+    if (sockfd == -1) {
+        printf("No available connections in the pool.\n");
         return;
     }
 
@@ -71,10 +158,38 @@ void send_rpc_request(const char *method, int num1, int num2) {
     size_t req_len = encode_request(&request, buffer, BUFFER_SIZE);
     printf("send:");
     print_hex(buffer, req_len);
-    send(sockfd, buffer, req_len, 0);
 
-    int resp_len = recv(sockfd, buffer, BUFFER_SIZE, 0);
-    if (resp_len > 0) {
+    int retries = 1; // 重试次数
+    while (retries > 0) {
+        if (send(sockfd, buffer, req_len, 0) == -1) {
+            perror("Send failed");
+            handle_connection_closed(pool, sockfd);
+            sockfd = get_connection(pool);
+            if (sockfd == -1) {
+                printf("No available connections in the pool after reconnection.\n");
+                return;
+            }
+            retries--;
+            continue;
+        }
+
+        int resp_len = recv(sockfd, buffer, BUFFER_SIZE, 0);
+        if (resp_len <= 0) {
+            if (resp_len == 0) {
+                printf("Server closed the connection.\n");
+            } else {
+                perror("Error receiving data from server");
+            }
+            handle_connection_closed(pool, sockfd);
+            sockfd = get_connection(pool);
+            if (sockfd == -1) {
+                printf("No available connections in the pool after reconnection.\n");
+                return;
+            }
+            retries--;
+            continue;
+        }
+
         RPCResponse response = RPCResponse_init_zero;
         if (decode_response(buffer, resp_len, &response)) {
             if (response.which_result == RPCResponse_value_tag) {
@@ -88,15 +203,28 @@ void send_rpc_request(const char *method, int num1, int num2) {
         } else {
             printf("Failed to decode response\n");
         }
+        break;
     }
-    close(sockfd);
+
+    release_connection(pool, sockfd);
 }
 
+// 主函数
 int main() {
-    send_rpc_request("add", 10, 5);
-    send_rpc_request("subtract", 10, 5);
-    send_rpc_request("multiply", 10, 5);
-    send_rpc_request("divide", 10, 5);
-    send_rpc_request("divide", 10, 0);
+    ConnectionPool pool;
+    init_connection_pool(&pool);
+
+    send_rpc_request(&pool, "add", 10, 5);
+    send_rpc_request(&pool, "subtract", 10, 5);
+    send_rpc_request(&pool, "multiply", 10, 5);
+    send_rpc_request(&pool, "divide", 10, 5);
+    send_rpc_request(&pool, "divide", 10, 0);
+
+    // 关闭连接池中的所有连接
+    for (int i = 0; i < CONNECTION_POOL_SIZE; i++) {
+        close(pool.connections[i]);
+    }
+    pthread_mutex_destroy(&pool.lock);
+
     return 0;
 }
