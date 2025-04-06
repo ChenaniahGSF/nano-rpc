@@ -8,12 +8,15 @@
 #include "rpc.pb.h"
 #include "pb_encode.h"
 #include "pb_decode.h"
+#include "thpool.h"
 
 #define SERVER_IP "127.0.0.1"
 #define SERVER_PORT 12345
 #define BUFFER_SIZE 256
 #define CONNECTION_POOL_SIZE 5
 #define TIMEOUT_SECONDS 5
+#define THREAD_POOL_SIZE 4
+threadpool thpool;
 
 // 连接池结构体
 typedef struct {
@@ -225,7 +228,7 @@ void send_rpc_request(ConnectionPool *pool, const char *method, int num1, int nu
 }
 
 // 异步处理响应的线程函数
-void* handle_response(void *arg) {
+void handle_response(void *arg) {
     RequestContext *context = (RequestContext *)arg;
     int sockfd = context->sockfd;
 
@@ -252,7 +255,19 @@ void* handle_response(void *arg) {
         }
     }
 
-    return NULL;
+    return;
+}
+
+// 示例回调函数
+void example_callback(RPCResponse *response) {
+    if (response->which_result == RPCResponse_value_tag) {
+        printf("Result: %d\n", response->result.value);
+    } else {
+        char error_msg[BUFFER_SIZE] = {0};
+        pb_istream_t err_stream = pb_istream_from_buffer((uint8_t *)response->result.error.arg, BUFFER_SIZE);
+        pb_read(&err_stream, error_msg, BUFFER_SIZE);
+        printf("Error: %s\n", error_msg);
+    }
 }
 
 // 异步发送 RPC 请求
@@ -290,10 +305,9 @@ void async_send_rpc_request(ConnectionPool *pool, const char *method, int num1, 
     pthread_mutex_init(&context->mutex, NULL);
     pthread_cond_init(&context->cond, NULL);
 
-    // 创建线程处理响应
-    pthread_t thread;
-    if (pthread_create(&thread, NULL, handle_response, (void *)context) != 0) {
-        perror("pthread_create error");
+    // 线程池任务
+    if(thpool_add_work(thpool, handle_response, (void *)context) == -1) {
+        perror("thpool_add_work error");
         free(context);
         handle_connection_closed(pool, sockfd);
         return;
@@ -319,18 +333,6 @@ void async_send_rpc_request(ConnectionPool *pool, const char *method, int num1, 
     pthread_cond_destroy(&context->cond);
     release_connection(pool, sockfd);
     free(context);
-}
-
-// 示例回调函数
-void example_callback(RPCResponse *response) {
-    if (response->which_result == RPCResponse_value_tag) {
-        printf("Result: %d\n", response->result.value);
-    } else {
-        char error_msg[BUFFER_SIZE] = {0};
-        pb_istream_t err_stream = pb_istream_from_buffer((uint8_t *)response->result.error.arg, BUFFER_SIZE);
-        pb_read(&err_stream, error_msg, BUFFER_SIZE);
-        printf("Error: %s\n", error_msg);
-    }
 }
 
 typedef struct {
@@ -396,6 +398,12 @@ int main() {
     ConnectionPool pool;
     init_connection_pool(&pool);
 
+    thpool = thpool_init(THREAD_POOL_SIZE);
+    if(thpool == NULL) {
+        perror("thpool_init error");
+        exit(EXIT_FAILURE);
+    }
+
     async_send_rpc_request(&pool, "add", 10, 5, example_callback);
     async_send_rpc_request(&pool, "subtract", 10, 5, example_callback);
     async_send_rpc_request(&pool, "multiply", 10, 5, example_callback);
@@ -407,6 +415,7 @@ int main() {
         close(pool.connections[i]);
     }
     pthread_mutex_destroy(&pool.lock);
+    thpool_destroy(thpool);
 
     return 0;
 }
